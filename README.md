@@ -1,6 +1,8 @@
-# continuous-claude-deepseek
+# continuous-agent for Claude Code and Codex CLI
 
 Windows-friendly continuous development automation for **Claude Code**, **Codex CLI**, and Claude Code Router / DeepSeek setups.
+
+> Repository name: `continuous-claude-deepseek`. Project positioning: `continuous-agent for Claude Code and Codex CLI`.
 
 It repeatedly asks an agent to do one small development iteration, then handles the boring GitHub loop for you:
 
@@ -8,7 +10,7 @@ It repeatedly asks an agent to do one small development iteration, then handles 
 read task -> edit code -> commit -> push branch -> create PR -> wait for checks -> merge -> repeat
 ```
 
-This project is based on [continuous-claude](https://github.com/AnandChowdhary/continuous-claude), with extra Windows, UTF-8, DeepSeek, and project-bootstrap support.
+This project is based on [continuous-claude](https://github.com/AnandChowdhary/continuous-claude), with extra Windows, UTF-8, DeepSeek, Codex CLI, and project-bootstrap support.
 
 ## Who Is This For?
 
@@ -29,10 +31,18 @@ Open PowerShell 7:
 irm https://raw.githubusercontent.com/jacobhodges934-boop/continuous-claude-deepseek/main/install.ps1 | iex
 ```
 
-By default this installs scripts to:
+By default this installs three scripts to:
 
 ```text
 ~\.local\bin
+```
+
+Installed commands:
+
+```text
+continuous-claude-deepseek.ps1   main runner, defaults to Claude Code
+continuous-codex.ps1             Codex CLI wrapper
+init-continuous-project.ps1      project task-file bootstrapper
 ```
 
 You can choose another folder:
@@ -90,8 +100,7 @@ pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
 Or start automation with Codex CLI:
 
 ```powershell
-pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
-  --provider codex `
+pwsh ~/.local/bin/continuous-codex.ps1 `
   --prompt "Read docs/NEXT_TASKS.md, docs/SHARED_TASK_NOTES.md, and docs/HANDOFF.md. Pick the highest-priority task that can be completed and verified in one small iteration. Do not expand scope. After finishing, run relevant checks and update the docs." `
   --max-runs 3 `
   --merge-strategy squash
@@ -161,17 +170,38 @@ pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
 
 ## Claude Code, Codex CLI, And DeepSeek
 
-Default provider is Claude Code:
+The main runner defaults to Claude Code:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 --prompt "Continue from docs/NEXT_TASKS.md" --max-runs 3
+```
+
+This is equivalent to:
 
 ```powershell
 --provider claude
 ```
 
-Use Codex CLI:
+Use Codex CLI through the short wrapper:
+
+```powershell
+pwsh ~/.local/bin/continuous-codex.ps1 --prompt "Continue from docs/NEXT_TASKS.md" --max-runs 3
+```
+
+Or call the main runner explicitly:
 
 ```powershell
 --provider codex
 ```
+
+PowerShell does not choose the model. It only starts the automation script. The selected provider CLI chooses the model:
+
+```text
+continuous-claude-deepseek.ps1 -> claude -> Claude Code / Router / DeepSeek / Anthropic config
+continuous-codex.ps1           -> codex  -> Codex CLI / OpenAI config
+```
+
+Codex CLI inherits defaults from its Codex config, and command-line overrides can take precedence for a run. Claude Code uses its own Claude Code or Router configuration.
 
 If Claude Code is routed to DeepSeek through Claude Code Router, this script avoids the common Windows issue where `claude -p` returns text but does not reliably perform file edits. It extracts the prompt and sends it through UTF-8 stdin while preserving CLI flags.
 
@@ -220,6 +250,7 @@ Disable commits too:
 ## Useful Files
 
 - [continuous-claude-deepseek.ps1](continuous-claude-deepseek.ps1): main automation runner
+- [continuous-codex.ps1](continuous-codex.ps1): thin Codex CLI entrypoint
 - [scripts/init-project.ps1](scripts/init-project.ps1): creates project task docs
 - [templates/continuous-project/docs/NEXT_TASKS.md](templates/continuous-project/docs/NEXT_TASKS.md): task list template
 - [templates/continuous-project/docs/SHARED_TASK_NOTES.md](templates/continuous-project/docs/SHARED_TASK_NOTES.md): project context template

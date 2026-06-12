@@ -427,6 +427,10 @@ function Add-Utf8Line {
         [string]$Path,
         [string]$Content
     )
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -Path $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
     [System.IO.File]::AppendAllText($Path, "$Content$([Environment]::NewLine)", $script:Utf8NoBom)
 }
 
