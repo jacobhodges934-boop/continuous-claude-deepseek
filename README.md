@@ -1,75 +1,236 @@
 # continuous-claude-deepseek
 
-> [continuous-claude](https://github.com/AnandChowdhary/continuous-claude) 的 DeepSeek 兼容版本。
+Windows-friendly continuous development automation for **Claude Code**, **Codex CLI**, and Claude Code Router / DeepSeek setups.
 
-## 这是什么
+It repeatedly asks an agent to do one small development iteration, then handles the boring GitHub loop for you:
 
-[continuous-claude](https://github.com/AnandChowdhary/continuous-claude) 是一个自动化开发工具：读取任务描述，循环调用 Claude Code CLI 执行代码修改，每轮自动创建分支 → commit → PR → 等 CI → 合并，实现 **GitHub PR 永动机**。
+```text
+read task -> edit code -> commit -> push branch -> create PR -> wait for checks -> merge -> repeat
+```
 
-**问题**：当 `claude` 通过 Router 走 DeepSeek 模型时，`-p` 模式下 DeepSeek 不执行工具调用。它只返回文本分析，不会用 Edit/Write 修改文件。
+This project is based on [continuous-claude](https://github.com/AnandChowdhary/continuous-claude), with extra Windows, UTF-8, DeepSeek, and project-bootstrap support.
 
-**解决**：`claude -p` → stdin pipe。DeepSeek 在 stdin 模式下能正常调用所有工具。
+## Who Is This For?
 
-## 与原始 continuous-claude 的区别
+Use this if you want a repo to keep moving through small PRs while you provide a task list, for example:
 
-| 特性 | 原始 | continuous-claude-deepseek |
-|------|------|---------------------------|
-| Claude 调用方式 | `claude -p "prompt"` | stdin pipe |
-| DeepSeek 兼容 | ❌ | ✅ |
-| 中文 PR 标题 | ❌ 乱码 | ✅ `gh api` UTF-8 安全 |
-| DeepSeek CNY 花费 | ❌ | ✅ 官方 token 计价 |
-| `invalid_json` 容错 | ❌ 直接失败 | ✅ 检测文件变更兜底 |
-| stdout/stderr | 混合写入 | ✅ 分离日志 |
-| PR 合并冲突 | 卡住 | ✅ `--admin` 强制 squash |
-| cost-tracking.jsonl | ❌ | ✅ 每轮 + 汇总 |
+- "finish the next E2E test task"
+- "read the handoff doc and continue the next safe step"
+- "fix one failing CI issue per iteration"
+- "keep improving docs until the checklist is complete"
 
-## 安装
+You do **not** need to remember long prompts. Put the project plan in files, then run the automation.
+
+## Install
+
+Open PowerShell 7:
 
 ```powershell
 irm https://raw.githubusercontent.com/jacobhodges934-boop/continuous-claude-deepseek/main/install.ps1 | iex
 ```
 
-## 用法
+By default this installs scripts to:
 
-```powershell
-# 基本用法
-continuous-claude-deepseek.ps1 --prompt "你的任务" --max-runs 5 --merge-strategy squash
-
-# 不限轮数（直到 3 次连续错误退出）
-continuous-claude-deepseek.ps1 --prompt "你的任务" --max-runs 0
-
-# Dry-run（模拟，不实际提交）
-continuous-claude-deepseek.ps1 --prompt "测试" --max-runs 1 --dry-run
+```text
+~\.local\bin
 ```
 
-### 模型选择
-
-通过 `CLAUDE_CODE_MODEL` 环境变量控制：
+You can choose another folder:
 
 ```powershell
-$env:CLAUDE_CODE_MODEL = "deepseek-v4-flash"  # 便宜（¥0.02-2/百万token）
-$env:CLAUDE_CODE_MODEL = "deepseek-v4-pro"    # 强力（¥0.025-6/百万token）
-# 不设 = 自动选择
+$env:INSTALL_DIR = "D:\tools\continuous-claude-deepseek"
+irm https://raw.githubusercontent.com/jacobhodges934-boop/continuous-claude-deepseek/main/install.ps1 | iex
 ```
 
-## 前置条件
+## Requirements
 
-- **PowerShell 7** (`pwsh`): `winget install Microsoft.PowerShell`
-- **Claude Code CLI** (`claude`)，可走 Router 到 DeepSeek
-- **GitHub CLI** (`gh`)，已登录: `gh auth login`
+- PowerShell 7 (`pwsh`)
 - Git
+- GitHub CLI (`gh`) logged in with `gh auth login`
+- One agent CLI:
+  - Claude Code: `claude`
+  - or Codex CLI: `codex`
 
-## DeepSeek 花费追踪
+For PR automation, the target project must be a Git repo with a GitHub remote, or you must pass `--owner` and `--repo`.
 
-每轮自动计算并输出 CNY 花费（基于 DeepSeek 官方 token 定价）：
+## Quick Start For A New Project
 
-| 模型 | 缓存命中输入 | 缓存未命中输入 | 输出 |
-|------|------------|-------------|------|
-| deepseek-v4-flash | ¥0.02/M | ¥1/M | ¥2/M |
-| deepseek-v4-pro | ¥0.025/M | ¥3/M | ¥6/M |
+Go to the project you want to automate:
 
-花费记录写入 `logs/cost-tracking.jsonl`，最终汇总显示 CNY 总额。
+```powershell
+cd D:\path\to\your-project
+```
 
-## 许可证
+Create the task files:
 
-MIT（继承自 [continuous-claude](https://github.com/AnandChowdhary/continuous-claude)）
+```powershell
+pwsh ~/.local/bin/init-continuous-project.ps1
+```
+
+This creates:
+
+```text
+docs/NEXT_TASKS.md          prioritized task list
+docs/SHARED_TASK_NOTES.md   project context and automation rules
+docs/HANDOFF.md             latest handoff, verification, risks, next steps
+```
+
+Edit `docs/NEXT_TASKS.md` and write what should happen next.
+
+Then start automation with Claude Code:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
+  --provider claude `
+  --prompt "Read docs/NEXT_TASKS.md, docs/SHARED_TASK_NOTES.md, and docs/HANDOFF.md. Pick the highest-priority task that can be completed and verified in one small iteration. Do not expand scope. After finishing, run relevant checks and update the docs." `
+  --max-runs 3 `
+  --merge-strategy squash
+```
+
+Or start automation with Codex CLI:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
+  --provider codex `
+  --prompt "Read docs/NEXT_TASKS.md, docs/SHARED_TASK_NOTES.md, and docs/HANDOFF.md. Pick the highest-priority task that can be completed and verified in one small iteration. Do not expand scope. After finishing, run relevant checks and update the docs." `
+  --max-runs 3 `
+  --merge-strategy squash
+```
+
+## How Tasks Work
+
+There are two supported styles.
+
+### 1. Direct Prompt
+
+Good for one-off work:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
+  --prompt "Fix the failing lint errors, run lint again, commit the smallest safe patch." `
+  --max-runs 1
+```
+
+### 2. Project Task Files
+
+Best for long-running automation:
+
+```powershell
+pwsh ~/.local/bin/init-continuous-project.ps1
+```
+
+Then write tasks into `docs/NEXT_TASKS.md`. The automation prompt tells the agent to read those files every iteration.
+
+This is the recommended workflow because GitHub readers and future agents can understand the project state without knowing your chat history.
+
+## Common Commands
+
+Run one iteration only:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 --prompt "Fix one small issue from docs/NEXT_TASKS.md" --max-runs 1
+```
+
+Run up to 5 successful iterations:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 --prompt "Continue from docs/NEXT_TASKS.md" --max-runs 5
+```
+
+Run until stopped, budget limit, or repeated errors:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 --prompt "Continue from docs/NEXT_TASKS.md" --max-runs 0
+```
+
+Dry run:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 --prompt "Test setup" --max-runs 1 --dry-run
+```
+
+Use explicit GitHub repo:
+
+```powershell
+pwsh ~/.local/bin/continuous-claude-deepseek.ps1 `
+  --owner your-github-user `
+  --repo your-repo `
+  --prompt "Continue from docs/NEXT_TASKS.md" `
+  --max-runs 3
+```
+
+## Claude Code, Codex CLI, And DeepSeek
+
+Default provider is Claude Code:
+
+```powershell
+--provider claude
+```
+
+Use Codex CLI:
+
+```powershell
+--provider codex
+```
+
+If Claude Code is routed to DeepSeek through Claude Code Router, this script avoids the common Windows issue where `claude -p` returns text but does not reliably perform file edits. It extracts the prompt and sends it through UTF-8 stdin while preserving CLI flags.
+
+## Windows And Chinese Text Safety
+
+This fork sets PowerShell and process IO to UTF-8 and avoids passing long PR bodies directly as command-line strings.
+
+It also protects GitHub PR titles from mojibake. If a generated title looks like corrupted Chinese, for example:
+
+```text
+E2E 娴嬭瘯鎵╁睍...
+```
+
+the PR title falls back to:
+
+```text
+chore: autonomous iteration <number>
+```
+
+The original generated title is kept in the PR body with a notice.
+
+## What Gets Created In GitHub?
+
+When branch automation is enabled, every successful iteration:
+
+1. creates a branch
+2. asks the agent to commit changes
+3. pushes the branch
+4. creates a pull request
+5. waits for checks
+6. merges the PR
+7. pulls the base branch
+
+Disable PR automation if you only want local commits:
+
+```powershell
+--disable-branches
+```
+
+Disable commits too:
+
+```powershell
+--disable-commits
+```
+
+## Useful Files
+
+- [continuous-claude-deepseek.ps1](continuous-claude-deepseek.ps1): main automation runner
+- [scripts/init-project.ps1](scripts/init-project.ps1): creates project task docs
+- [templates/continuous-project/docs/NEXT_TASKS.md](templates/continuous-project/docs/NEXT_TASKS.md): task list template
+- [templates/continuous-project/docs/SHARED_TASK_NOTES.md](templates/continuous-project/docs/SHARED_TASK_NOTES.md): project context template
+- [templates/continuous-project/docs/HANDOFF.md](templates/continuous-project/docs/HANDOFF.md): handoff template
+
+## Notes
+
+- Old PR titles already written to GitHub do not automatically change when you fix this script. Edit them with `gh pr edit <number> --title "normal title"`.
+- Do not run unlimited iterations on a repo you do not trust.
+- Keep tasks small and verifiable. This tool works best when every iteration can pass tests or produce a clear handoff.
+
+## License
+
+MIT, following the original continuous-claude project.
