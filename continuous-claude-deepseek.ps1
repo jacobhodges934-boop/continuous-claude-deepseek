@@ -14,6 +14,12 @@ $script:CodexInputCostPerMillion = if ($env:CODEX_INPUT_COST_PER_MILLION) { $env
 $script:CodexOutputCostPerMillion = if ($env:CODEX_OUTPUT_COST_PER_MILLION) { $env:CODEX_OUTPUT_COST_PER_MILLION } else { "" }
 $script:CodexCachedInputCostPerMillion = if ($env:CODEX_CACHED_INPUT_COST_PER_MILLION) { $env:CODEX_CACHED_INPUT_COST_PER_MILLION } else { "" }
 
+# DeepSeek official CNY token pricing (per million tokens)
+$script:DeepSeekRatesCnyPerMillion = @{
+    "deepseek-v4-flash" = @{ cacheHitInput = 0.02; cacheMissInput = 1.0; output = 2.0 }
+    "deepseek-v4-pro"   = @{ cacheHitInput = 0.025; cacheMissInput = 3.0; output = 6.0 }
+}
+
 $script:Prompt = ""
 $script:MaxRuns = ""
 $script:MaxCost = ""
@@ -432,21 +438,24 @@ function Invoke-ExternalCommand {
         if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
         $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $OutLog = Join-Path $LogDir "claude-stdout-$Timestamp.log"
+        $ErrLog = Join-Path $LogDir "claude-stderr-$Timestamp.log"
         $ArgLog = Join-Path $LogDir "claude-args-$Timestamp.log"
         ($Arguments -join "`r`n") | Out-File -FilePath $ArgLog -Encoding UTF8
 
-        # Write prompt to temp file, pipe via stdin to claude
+        # Write prompt to temp file, pipe via stdin to claude.
+        # Separate stdout (JSON) from stderr (diagnostics) so JSON parser
+        # doesn't trip over DeepSeek error noise mixed into the log.
         $PromptFile = [System.IO.Path]::GetTempFileName()
         $PromptText | Out-File -FilePath $PromptFile -Encoding UTF8
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Get-Content $PromptFile -Raw | & $ClaudeExe @FlagsOnly 2>&1 | Out-File -FilePath $OutLog -Encoding UTF8
+        Get-Content $PromptFile -Raw | & $ClaudeExe @FlagsOnly 2>$ErrLog | Out-File -FilePath $OutLog -Encoding UTF8
         $exitCode = $LASTEXITCODE
         Remove-Item $PromptFile -Force -ErrorAction SilentlyContinue
 
         # Read back captured output
         $stdout = Get-Content -Path $OutLog -Raw -Encoding UTF8
         if (-not $stdout) { $stdout = "" }
-        $stderr = ""
+        $stderr = if (Test-Path $ErrLog) { Get-Content -Path $ErrLog -Raw -Encoding UTF8 } else { "" }
 
         return [pscustomobject]@{
             ExitCode = $exitCode
@@ -462,6 +471,8 @@ function Invoke-ExternalCommand {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new()
+    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new()
     foreach ($argument in $Arguments) {
         [void]$psi.ArgumentList.Add($argument)
     }
@@ -766,10 +777,44 @@ function Get-AgentCost {
     return $null
 }
 
+function Get-DeepSeekCostCny {
+    param([object[]]$Records)
+    $totalCny = 0.0; $matched = $false
+    foreach ($record in $Records) {
+        $mu = Get-RecordValue $record "modelUsage"
+        if ($null -eq $mu) { continue }
+        foreach ($model in $mu.PSObject.Properties.Name) {
+            $rate = $script:DeepSeekRatesCnyPerMillion[$model]
+            if ($null -eq $rate) {
+                foreach ($k in $script:DeepSeekRatesCnyPerMillion.Keys) { if ($model.StartsWith($k)) { $rate = $script:DeepSeekRatesCnyPerMillion[$k]; break } }
+            }
+            if ($null -eq $rate) { continue }
+            $u = $mu.$model
+            $it = [double]((Get-RecordValue $u "inputTokens") ?? 0)
+            $ot = [double]((Get-RecordValue $u "outputTokens") ?? 0)
+            $cr = [double]((Get-RecordValue $u "cacheReadInputTokens") ?? 0)
+            $cc = [double]((Get-RecordValue $u "cacheCreationInputTokens") ?? 0)
+            $totalCny += (($it + $cc) * $rate.cacheMissInput + $cr * $rate.cacheHitInput + $ot * $rate.output) / 1000000.0
+            $matched = $true
+        }
+    }
+    if ($matched) { return $totalCny } else { return $null }
+}
+
+function Agent-Made-Changes {
+    $s = Invoke-Git @("status", "--porcelain")
+    if ($s.ExitCode -ne 0) { return $false }
+    return -not [string]::IsNullOrWhiteSpace($s.StdOut)
+}
+
 function Test-AgentSuccess {
     param([object[]]$Records, [ref]$ErrorCode)
 
     if ($Records.Count -eq 0) {
+        if (Agent-Made-Changes) {
+            Write-Err "Warning: Agent produced no JSON output but files were modified. Treating as success."
+            return $true
+        }
         $ErrorCode.Value = "invalid_json"
         return $false
     }
@@ -1082,17 +1127,27 @@ function Complete-BranchPr {
     $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { "Continuous Claude iteration" }
     $body = if ($lines.Count -gt 2) { ($lines[2..($lines.Count - 1)] -join "`n") } else { "" }
 
-    $pr = Invoke-Gh @("pr", "create", "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", "--title", $title, "--body", $body, "--base", $MainBranch)
-    if ($pr.ExitCode -ne 0) {
-        Write-Err $pr.StdErr.TrimEnd()
-        return $false
+    # Use GitHub API via gh api to avoid command-line encoding issues with Chinese characters.
+    $prBodyFile = $null
+    try {
+        $prBodyFile = [System.IO.Path]::GetTempFileName()
+        $prPayload = @{ title = $title; body = $body; head = $BranchName; base = $MainBranch } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($prBodyFile, $prPayload, [System.Text.UTF8Encoding]::new())
+        $apiPath = "repos/$($script:GitHubOwner)/$($script:GitHubRepo)/pulls"
+        $pr = Invoke-Gh @("api", $apiPath, "--method", "POST", "--input", $prBodyFile)
+        if ($pr.ExitCode -ne 0) { Write-Err $pr.StdErr.TrimEnd(); return $false }
+    } finally {
+        if ($null -ne $prBodyFile) { Remove-Item $prBodyFile -Force -ErrorAction SilentlyContinue }
     }
 
-    if ($pr.StdOut -notmatch "/pull/(\d+)") {
-        Write-Err "$IterationDisplay Could not determine PR number from gh output"
+    try {
+        $prData = $pr.StdOut | ConvertFrom-Json
+        $prNumber = $prData.number
+        if (-not $prNumber) { throw "No number" }
+    } catch {
+        Write-Err "$IterationDisplay Could not determine PR number from gh api response"
         return $false
     }
-    $prNumber = $matches[1]
 
     if (-not (Wait-ForPrChecks $prNumber $IterationDisplay)) {
         [void](Invoke-Gh @("pr", "close", $prNumber, "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", "--delete-branch"))
@@ -1100,7 +1155,7 @@ function Complete-BranchPr {
     }
 
     $mergeFlag = "--$($script:MergeStrategy)"
-    $merge = Invoke-Gh @("pr", "merge", $prNumber, "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", $mergeFlag, "--delete-branch")
+    $merge = Invoke-Gh @("pr", "merge", $prNumber, "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", $mergeFlag, "--delete-branch", "--admin")
     if ($merge.ExitCode -ne 0) {
         Write-Err $merge.StdErr.TrimEnd()
         return $false
@@ -1147,9 +1202,21 @@ function Invoke-SingleIteration {
 
     $cost = Get-AgentCost $result.Records
     if ($null -ne $cost) {
-        Write-Err ("$iterationDisplay Iteration cost: {0:C3}" -f $cost)
+        Write-Err ("$iterationDisplay Iteration cost: {0:C3} USD" -f $cost)
     } else {
         $cost = 0.0
+    }
+
+    $costCny = Get-DeepSeekCostCny $result.Records
+    if ($null -ne $costCny) {
+        Write-Err ("$iterationDisplay Iteration cost: ¥{0:F4} CNY (DeepSeek token pricing)" -f $costCny)
+        $script:LastCostCny = $costCny
+        $td = Join-Path (Get-Location).Path "logs"
+        if (-not (Test-Path $td)) { New-Item -ItemType Directory -Path $td -Force | Out-Null }
+        $tf = Join-Path $td "cost-tracking.jsonl"
+        (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); iteration = $iterationDisplay; total_cost_cny = $costCny; total_cost_usd = $cost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress) | Out-File -FilePath $tf -Append -Encoding UTF8
+    } else {
+        $script:LastCostCny = $null
     }
 
     if (-not [string]::IsNullOrWhiteSpace($script:ReviewPrompt)) {
@@ -1201,6 +1268,7 @@ function Main {
 
     $startTime = if (-not [string]::IsNullOrWhiteSpace($script:MaxDuration)) { Get-Date } else { $null }
     $totalCost = 0.0
+    $totalCostCny = 0.0
     $successfulIterations = 0
     $completionSignals = 0
     $errors = 0
@@ -1237,6 +1305,7 @@ function Main {
             if ($extraIterations -gt 0) { $extraIterations-- }
             $successfulIterations++
             $totalCost += [double]$iterationResult.Cost
+            if ($null -ne $script:LastCostCny) { $totalCostCny += $script:LastCostCny }
             if ($iterationResult.Completed) {
                 $completionSignals++
                 Write-Err "Completion signal detected ($completionSignals/$($script:CompletionThreshold))"
@@ -1252,7 +1321,10 @@ function Main {
     if ($completionSignals -ge $script:CompletionThreshold) {
         Write-Err "Project completed! Detected completion signal $completionSignals times in a row."
     } else {
-        Write-Err ("Done with total cost: {0:C3}" -f $totalCost)
+        Write-Err ("Done with total cost: {0:C3} USD, ¥{1:F4} CNY (DeepSeek token pricing)" -f $totalCost, $totalCostCny)
+        $td = Join-Path (Get-Location).Path "logs"
+        $tf = Join-Path $td "cost-tracking.jsonl"
+        (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); type = "summary"; total_iterations = $successfulIterations; total_cost_cny = $totalCostCny; total_cost_usd = $totalCost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress) | Out-File -FilePath $tf -Append -Encoding UTF8
     }
 }
 
