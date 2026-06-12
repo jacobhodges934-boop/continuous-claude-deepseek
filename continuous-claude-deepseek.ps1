@@ -3,6 +3,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = $script:Utf8NoBom
+[Console]::OutputEncoding = $script:Utf8NoBom
+$OutputEncoding = $script:Utf8NoBom
+
 $script:Version = "v0.24.7"
 $script:ClaudeFlags = @("--dangerously-skip-permissions", "--output-format=json")
 $script:CodexFlags = @("--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check")
@@ -35,6 +40,7 @@ $script:CompletionSignal = "CONTINUOUS_CLAUDE_PROJECT_COMPLETE"
 $script:CompletionThreshold = 3
 $script:ReviewPrompt = ""
 $script:DisableUpdates = $false
+$script:SelfTest = $false
 $script:ExtraAgentFlags = [System.Collections.Generic.List[string]]::new()
 
 $script:PromptCommitMessage = "Please review all uncommitted changes in the git repository (both modified and new files). Write a commit message with: (1) a short one-line summary, (2) two newlines, (3) then a detailed explanation. Do not include any footers or metadata like 'Generated with Claude Code' or 'Co-Authored-By'. Feel free to look at the last few commits to get a sense of the commit message style for consistency. First run 'git add .' to stage all changes including new untracked files, then commit using 'git commit -m `"your message`"' (don't push, just commit, no need to ask for confirmation)."
@@ -126,6 +132,7 @@ OPTIONAL FLAGS:
                                     Output token rate for Codex --max-cost estimates
     --codex-cached-input-cost-per-million <dollars>
                                     Cached input token rate for Codex estimates (defaults to input rate)
+    --self-test                     Run built-in UTF-8 and mojibake title checks
     --                              Stop parsing continuous-claude options; forward the rest to the provider CLI
 
 EXAMPLES:
@@ -271,6 +278,11 @@ function Parse-Arguments {
                 $i++
                 continue
             }
+            "^--self-test$" {
+                $script:SelfTest = $true
+                $i++
+                continue
+            }
             "^--auto-update$" {
                 Exit-UnsupportedFlag $arg
             }
@@ -402,66 +414,122 @@ function Format-Duration {
     return ($parts -join " ")
 }
 
+function Write-Utf8File {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+    [System.IO.File]::WriteAllText($Path, $Content, $script:Utf8NoBom)
+}
+
+function Add-Utf8Line {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+    [System.IO.File]::AppendAllText($Path, "$Content$([Environment]::NewLine)", $script:Utf8NoBom)
+}
+
+function Test-MojibakeText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $markers = @("娴", "鎵", "锛", "鈥", "鐢", "鍙", "绋", "杩", "瀹", "妯", "鍚", "顖", "€")
+    foreach ($marker in $markers) {
+        if ($Text.Contains($marker)) { return $true }
+    }
+    return $false
+}
+
+function Get-FallbackPrTitle {
+    param([string]$BranchName)
+
+    $iteration = "unknown"
+    if ($BranchName -match "iteration-(\d+)") {
+        $iteration = $matches[1]
+    }
+    return "chore: autonomous iteration $iteration"
+}
+
+function Get-SafePullRequestMetadata {
+    param(
+        [string]$CommitMessage,
+        [string]$BranchName
+    )
+
+    $lines = @($CommitMessage -split "\r?\n")
+    $rawTitle = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0].Trim() } else { "Continuous Claude iteration" }
+    $body = if ($lines.Count -gt 2) { ($lines[2..($lines.Count - 1)] -join "`n").Trim() } else { "" }
+    $mergeBody = $body
+    $title = $rawTitle
+    $titleWasMojibake = Test-MojibakeText $rawTitle
+
+    if ($titleWasMojibake) {
+        $title = Get-FallbackPrTitle $BranchName
+        $notice = @(
+            "Note: detected mojibake in the generated title, ignored as PR title.",
+            "",
+            "Original generated title:",
+            $rawTitle
+        ) -join "`n"
+        if ([string]::IsNullOrWhiteSpace($body)) {
+            $body = $notice
+        } else {
+            $body = "$notice`n`n$body"
+        }
+        $mergeBody = if ([string]::IsNullOrWhiteSpace($mergeBody)) {
+            "Generated title was ignored because it looked like mojibake."
+        } else {
+            "Generated title was ignored because it looked like mojibake.`n`n$mergeBody"
+        }
+    }
+
+    return [pscustomobject]@{
+        Title = $title
+        Body = $body
+        MergeBody = $mergeBody
+        OriginalTitle = $rawTitle
+        TitleWasMojibake = $titleWasMojibake
+    }
+}
+
 function Invoke-ExternalCommand {
     param(
         [string]$FilePath,
         [string[]]$Arguments
     )
 
-    # On Windows, System.Diagnostics.Process.Start does not reliably pass
-    # --output-format flags to claude. Use PowerShell's native invocation
-    # for claude, which properly preserves all CLI flags.
-    if ($FilePath -eq "claude") {
-        $Resolved = Get-Command "$FilePath.cmd" -ErrorAction SilentlyContinue
-        if (-not $Resolved) { $Resolved = Get-Command $FilePath -ErrorAction SilentlyContinue }
-        $ClaudeExe = if ($Resolved) { $Resolved.Source } else { $FilePath }
+    $standardInput = $null
+    $OutLog = $null
+    $ErrLog = $null
+    $ArgLog = $null
 
+    if ($FilePath -eq "claude") {
         # DeepSeek/Windows workaround: -p flag blocks tool use (Edit/Write).
-        # Extract prompt from -p arg and pipe via stdin instead.
-        $PromptText = ""
+        # Extract prompt from -p and send it through UTF-8 stdin.
+        $standardInput = ""
         $FlagsOnly = [System.Collections.Generic.List[string]]::new()
         $skipNext = $false
         for ($i = 0; $i -lt $Arguments.Count; $i++) {
             if ($skipNext) { $skipNext = $false; continue }
             if ($Arguments[$i] -eq "-p") {
                 if ($i + 1 -lt $Arguments.Count) {
-                    $PromptText = $Arguments[$i + 1]
+                    $standardInput = $Arguments[$i + 1]
                     $skipNext = $true
                 }
             } else {
                 [void]$FlagsOnly.Add($Arguments[$i])
             }
         }
+        $Arguments = $FlagsOnly.ToArray()
 
-        # Debug log paths
         $LogDir = Join-Path (Get-Location).Path "logs"
         if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
         $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $OutLog = Join-Path $LogDir "claude-stdout-$Timestamp.log"
         $ErrLog = Join-Path $LogDir "claude-stderr-$Timestamp.log"
         $ArgLog = Join-Path $LogDir "claude-args-$Timestamp.log"
-        ($Arguments -join "`r`n") | Out-File -FilePath $ArgLog -Encoding UTF8
-
-        # Write prompt to temp file, pipe via stdin to claude.
-        # Separate stdout (JSON) from stderr (diagnostics) so JSON parser
-        # doesn't trip over DeepSeek error noise mixed into the log.
-        $PromptFile = [System.IO.Path]::GetTempFileName()
-        $PromptText | Out-File -FilePath $PromptFile -Encoding UTF8
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Get-Content $PromptFile -Raw | & $ClaudeExe @FlagsOnly 2>$ErrLog | Out-File -FilePath $OutLog -Encoding UTF8
-        $exitCode = $LASTEXITCODE
-        Remove-Item $PromptFile -Force -ErrorAction SilentlyContinue
-
-        # Read back captured output
-        $stdout = Get-Content -Path $OutLog -Raw -Encoding UTF8
-        if (-not $stdout) { $stdout = "" }
-        $stderr = if (Test-Path $ErrLog) { Get-Content -Path $ErrLog -Raw -Encoding UTF8 } else { "" }
-
-        return [pscustomobject]@{
-            ExitCode = $exitCode
-            StdOut = $stdout
-            StdErr = $stderr
-        }
+        Write-Utf8File $ArgLog ($Arguments -join "`r`n")
     }
 
     $psi = [Diagnostics.ProcessStartInfo]::new()
@@ -471,8 +539,12 @@ function Invoke-ExternalCommand {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new()
-    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new()
+    $psi.StandardOutputEncoding = $script:Utf8NoBom
+    $psi.StandardErrorEncoding = $script:Utf8NoBom
+    if ($null -ne $standardInput) {
+        $psi.RedirectStandardInput = $true
+        $psi.StandardInputEncoding = $script:Utf8NoBom
+    }
     foreach ($argument in $Arguments) {
         [void]$psi.ArgumentList.Add($argument)
     }
@@ -480,9 +552,18 @@ function Invoke-ExternalCommand {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $psi
     [void]$process.Start()
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if ($null -ne $standardInput) {
+        $process.StandardInput.Write($standardInput)
+        $process.StandardInput.Close()
+    }
     $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+
+    if ($null -ne $OutLog) { Write-Utf8File $OutLog $stdout }
+    if ($null -ne $ErrLog) { Write-Utf8File $ErrLog $stderr }
 
     return [pscustomobject]@{
         ExitCode = $process.ExitCode
@@ -1123,16 +1204,19 @@ function Complete-BranchPr {
     }
 
     $commitMessage = (Invoke-Git @("log", "-1", "--format=%B", $BranchName)).StdOut.Trim()
-    $lines = @($commitMessage -split "\r?\n")
-    $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { "Continuous Claude iteration" }
-    $body = if ($lines.Count -gt 2) { ($lines[2..($lines.Count - 1)] -join "`n") } else { "" }
+    $metadata = Get-SafePullRequestMetadata $commitMessage $BranchName
+    $title = $metadata.Title
+    $body = $metadata.Body
+    if ($metadata.TitleWasMojibake) {
+        Write-Err "$IterationDisplay Detected mojibake in generated PR title; using fallback title: $title"
+    }
 
     # Use GitHub API via gh api to avoid command-line encoding issues with Chinese characters.
     $prBodyFile = $null
     try {
         $prBodyFile = [System.IO.Path]::GetTempFileName()
         $prPayload = @{ title = $title; body = $body; head = $BranchName; base = $MainBranch } | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText($prBodyFile, $prPayload, [System.Text.UTF8Encoding]::new())
+        Write-Utf8File $prBodyFile $prPayload
         $apiPath = "repos/$($script:GitHubOwner)/$($script:GitHubRepo)/pulls"
         $pr = Invoke-Gh @("api", $apiPath, "--method", "POST", "--input", $prBodyFile)
         if ($pr.ExitCode -ne 0) { Write-Err $pr.StdErr.TrimEnd(); return $false }
@@ -1155,10 +1239,21 @@ function Complete-BranchPr {
     }
 
     $mergeFlag = "--$($script:MergeStrategy)"
-    $merge = Invoke-Gh @("pr", "merge", $prNumber, "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", $mergeFlag, "--delete-branch", "--admin")
-    if ($merge.ExitCode -ne 0) {
-        Write-Err $merge.StdErr.TrimEnd()
-        return $false
+    $mergeBodyFile = $null
+    try {
+        $mergeArgs = @("pr", "merge", $prNumber, "--repo", "$($script:GitHubOwner)/$($script:GitHubRepo)", $mergeFlag, "--delete-branch", "--admin")
+        if ($script:MergeStrategy -in @("squash", "merge")) {
+            $mergeBodyFile = [System.IO.Path]::GetTempFileName()
+            Write-Utf8File $mergeBodyFile $metadata.MergeBody
+            $mergeArgs += @("--subject", $title, "--body-file", $mergeBodyFile)
+        }
+        $merge = Invoke-Gh $mergeArgs
+        if ($merge.ExitCode -ne 0) {
+            Write-Err $merge.StdErr.TrimEnd()
+            return $false
+        }
+    } finally {
+        if ($null -ne $mergeBodyFile) { Remove-Item $mergeBodyFile -Force -ErrorAction SilentlyContinue }
     }
 
     [void](Invoke-Git @("checkout", $MainBranch))
@@ -1214,7 +1309,7 @@ function Invoke-SingleIteration {
         $td = Join-Path (Get-Location).Path "logs"
         if (-not (Test-Path $td)) { New-Item -ItemType Directory -Path $td -Force | Out-Null }
         $tf = Join-Path $td "cost-tracking.jsonl"
-        (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); iteration = $iterationDisplay; total_cost_cny = $costCny; total_cost_usd = $cost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress) | Out-File -FilePath $tf -Append -Encoding UTF8
+        Add-Utf8Line $tf (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); iteration = $iterationDisplay; total_cost_cny = $costCny; total_cost_usd = $cost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress)
     } else {
         $script:LastCostCny = $null
     }
@@ -1261,8 +1356,37 @@ function Invoke-SingleIteration {
     return [pscustomobject]@{ Success = $true; Completed = $completed; Cost = $cost }
 }
 
+function Invoke-SelfTest {
+    $goodTitle = "feat: 修复上传流程和任务监控"
+    $good = Get-SafePullRequestMetadata "$goodTitle`n`n正常正文" "continuous-claude/iteration-7/test"
+    if ($good.Title -ne $goodTitle) {
+        throw "Expected Chinese title to be preserved, got: $($good.Title)"
+    }
+    if (Test-MojibakeText $good.Title) {
+        throw "Expected Chinese title not to be flagged as mojibake"
+    }
+
+    $badTitle = "E2E 娴嬭瘯鎵╁睍"
+    $bad = Get-SafePullRequestMetadata "$badTitle`n`n乱码来源正文" "continuous-claude/iteration-8/test"
+    if ($bad.Title -ne "chore: autonomous iteration 8") {
+        throw "Expected mojibake title fallback, got: $($bad.Title)"
+    }
+    if (-not $bad.TitleWasMojibake) {
+        throw "Expected mojibake title to be flagged"
+    }
+    if ($bad.Body -notlike "*detected mojibake*" -or $bad.Body -notlike "*$badTitle*") {
+        throw "Expected PR body to include mojibake notice and original generated title"
+    }
+
+    Write-Output "Self-test passed: UTF-8 Chinese title preserved and mojibake title falls back."
+}
+
 function Main {
     Parse-Arguments @($args)
+    if ($script:SelfTest) {
+        Invoke-SelfTest
+        return
+    }
     Validate-Arguments
     Validate-Requirements
 
@@ -1324,7 +1448,7 @@ function Main {
         Write-Err ("Done with total cost: {0:C3} USD, ¥{1:F4} CNY (DeepSeek token pricing)" -f $totalCost, $totalCostCny)
         $td = Join-Path (Get-Location).Path "logs"
         $tf = Join-Path $td "cost-tracking.jsonl"
-        (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); type = "summary"; total_iterations = $successfulIterations; total_cost_cny = $totalCostCny; total_cost_usd = $totalCost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress) | Out-File -FilePath $tf -Append -Encoding UTF8
+        Add-Utf8Line $tf (@{ timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"); type = "summary"; total_iterations = $successfulIterations; total_cost_cny = $totalCostCny; total_cost_usd = $totalCost; pricing_source = "deepseek-official-cny-token-pricing" } | ConvertTo-Json -Compress)
     }
 }
 
